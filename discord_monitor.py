@@ -1,35 +1,28 @@
 """
-Discord Self-Bot Join Monitor → Telegram Alerts
-Monitors 42 servers for new members, sends detailed Telegram alerts.
-Includes Flask keep‑alive for 24/7 hosting on Render.
+Discord Self-Bot Join Monitor → Telegram Alerts (Polling Mode)
+Monitors 42 servers for new members via API polling.
+Works without View Audit Log permission – captures every join.
 """
 
 import asyncio
 import os
 import requests
-import discord
-import logging
 import time
 from datetime import datetime, timezone
 from flask import Flask
 from threading import Thread
+from collections import deque
 
-# ------------------ SUPPRESS DISCORD LOGS ------------------
-logging.getLogger('discord.gateway').setLevel(logging.WARNING)
-logging.getLogger('discord.client').setLevel(logging.WARNING)
-logging.getLogger('discord.http').setLevel(logging.WARNING)
-
-# ------------------ READ TOKENS FROM ENVIRONMENT ------------------
+# ------------------ READ TOKENS ------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 if not DISCORD_TOKEN or not TELEGRAM_TOKEN or not CHAT_ID:
-    raise Exception("Missing environment variables: DISCORD_TOKEN, TELEGRAM_TOKEN, CHAT_ID")
+    raise Exception("Missing environment variables")
 
-# ------------------ ALL 42 SERVERS (ID → friendly name) ------------------
+# ------------------ 42 SERVERS (ID → name) ------------------
 SERVERS = {
-    # Original 32
     "1196857788220067943": "Variational",
     "667044843901681675": "Optimism",
     "1364669301751283793": "Solflare",
@@ -62,7 +55,6 @@ SERVERS = {
     "933846070344167464": "Moonwell Fi",
     "839766295808311306": "Telcoin",
     "1270276651636232282": "Pharos",
-    # New 10 servers
     "1211893851489304576": "ORANGE WEB3",
     "1268289052264632434": "SKY",
     "1334957028334112922": "40 Acres",
@@ -75,66 +67,62 @@ SERVERS = {
     "1303532852003995689": "Vanish Trade",
 }
 
-# Servers to ignore (spammy)
 IGNORED_SERVERS = {"703994580499955784", "1067165013397213286"}
 
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-last_debug_time = {}
+HEADERS = {"Authorization": DISCORD_TOKEN}
 
-# ------------------ TELEGRAM SENDER ------------------
+# ------------------ TELEGRAM SENDER (no location) ------------------
 def escape_md(text: str) -> str:
     special = r"\_*[]()~`>#+-=|{}.!"
     return "".join(f"\\{c}" if c in special else c for c in str(text))
 
-def send_telegram_alert(member, server_name: str):
-    joined_at = member.joined_at
-    joined_str = joined_at.strftime("%Y-%m-%d %H:%M UTC") if joined_at else "Unknown"
-    discrim = f"#{member.discriminator}" if member.discriminator and member.discriminator != "0" else ""
-
-    # Calculate account age using aware datetime
-    now = datetime.now(timezone.utc)
-    delta = now - member.created_at
-    years = delta.days // 365
-    months = (delta.days % 365) // 30
-    days = delta.days % 30
-    if years > 0:
-        age_str = f"{years}y {months}m {days}d"
-    elif months > 0:
-        age_str = f"{months}m {days}d"
-    else:
-        age_str = f"{days}d"
-
-    text = (
-        f"🚨 *New Member Joined\\!*\n\n"
-        f"🏠 *Server:* {escape_md(server_name)}\n"
-        f"👤 *Username:* `{escape_md(member.name)}{escape_md(discrim)}`\n"
-        f"✨ *Display name:* {escape_md(member.display_name)}\n"
-        f"🆔 *User ID:* `{escape_md(str(member.id))}`\n"
-        f"📅 *Joined server:* {escape_md(joined_str)}\n"
-        f"📆 *Account age:* {escape_md(age_str)}\n"
-        f"👥 *Member count:* {escape_md(str(member.guild.member_count))}\n"
-        f"📍 *Location:* not available via Discord API"
-    )
-
+def send_telegram(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        resp = requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "MarkdownV2"},
-            timeout=10,
-        )
-        if resp.json().get("ok"):
-            print(f"  ✅ Alert sent for {member.name} in {server_name}")
-        else:
-            print(f"  ❌ Telegram error: {resp.json()}")
+        requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "MarkdownV2"}, timeout=10)
     except Exception as e:
-        print(f"  ❌ Telegram exception: {e}")
+        print(f"Telegram error: {e}")
+
+def send_startup_message(connected, total):
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    text = (
+        f"✅ *Monitor Online*\n"
+        f"Connected: `{connected}/{total}` servers\n"
+        f"Started: `{now_str}`\n"
+        f"Watching for new joins (polling every 45s)..."
+    )
+    send_telegram(text)
+
+# ------------------ MEMBER FETCH (pagination for large servers) ------------------
+def get_all_members(guild_id):
+    """Fetch all member IDs from a Discord guild using pagination."""
+    members = []
+    after = None
+    url = f"https://discord.com/api/v9/guilds/{guild_id}/members?limit=1000"
+    while True:
+        if after:
+            paginated_url = f"{url}&after={after}"
+        else:
+            paginated_url = url
+        response = requests.get(paginated_url, headers=HEADERS)
+        if response.status_code != 200:
+            print(f"Failed to fetch members for {guild_id}: {response.status_code}")
+            break
+        data = response.json()
+        if not data:
+            break
+        members.extend(data)
+        after = data[-1]['user']['id']
+        if len(data) < 1000:
+            break
+    return members
 
 # ------------------ FLASK KEEP-ALIVE ------------------
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Join monitor is alive."
+    return "Join monitor is alive (polling mode)."
 
 def run_webserver():
     port = int(os.environ.get("PORT", 8080))
@@ -145,59 +133,93 @@ def keep_alive():
     t.daemon = True
     t.start()
 
-# ------------------ DISCORD CLIENT ------------------
-client = discord.Client()
-verified_servers = {}
-joined_servers = set()
+# ------------------ POLLING ENGINE ------------------
+previous_members = {}  # guild_id -> set of user IDs
+member_details = {}    # guild_id -> dict {user_id: member_object}
+last_poll = {}
 
-@client.event
-async def on_ready():
-    print("=" * 60)
-    print(f"✅ LOGGED IN AS: {client.user} ({client.user.id})")
-    print(f"📅 Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
-    print("=" * 60)
+def account_age(created_at):
+    now = datetime.now(timezone.utc)
+    delta = now - created_at
+    years = delta.days // 365
+    months = (delta.days % 365) // 30
+    days = delta.days % 30
+    if years > 0:
+        return f"{years}y {months}m {days}d"
+    elif months > 0:
+        return f"{months}m {days}d"
+    else:
+        return f"{days}d"
 
-    print("\n📋 SERVERS YOU ARE IN:")
-    for guild in client.guilds:
-        ignored = " [IGNORED]" if str(guild.id) in IGNORED_SERVERS else ""
-        print(f"  🔹 {guild.name}{ignored} – ID: {guild.id} – Members: {guild.member_count}")
-        joined_servers.add(str(guild.id))
+def format_alert(member, server_name):
+    joined_at = member.get('joined_at')
+    joined_str = joined_at.replace('T', ' ').replace('Z', ' UTC') if joined_at else "Unknown"
+    user = member['user']
+    username = user.get('global_name') or user['username']
+    user_id = user['id']
+    discrim = f"#{user.get('discriminator', '0')}" if user.get('discriminator') and user['discriminator'] != '0' else ""
+    display_name = member.get('nick') or username
+    created = datetime.fromisoformat(user['created_at'].replace('Z', '+00:00'))
+    age_str = account_age(created)
+    member_count = "?"  # we don't fetch member count in polling to save requests; can be added optionally
 
-    print("\n📡 VERIFYING MONITORED SERVERS...")
-    for guild_id, name in SERVERS.items():
-        if guild_id in joined_servers:
-            guild = discord.utils.get(client.guilds, id=int(guild_id))
-            print(f"  ✅ {name} – ID: {guild_id} – Members: {guild.member_count if guild else '?'}")
-            verified_servers[guild_id] = name
-        else:
-            print(f"  ❌ {name} – ID: {guild_id} – NOT IN SERVER")
+    text = (
+        f"🚨 *New Member Joined\\!*\n\n"
+        f"🏠 *Server:* {escape_md(server_name)}\n"
+        f"👤 *Username:* `{escape_md(username)}{escape_md(discrim)}`\n"
+        f"✨ *Display name:* {escape_md(display_name)}\n"
+        f"🆔 *User ID:* `{user_id}`\n"
+        f"📅 *Joined server:* {escape_md(joined_str)}\n"
+        f"📆 *Account age:* {escape_md(age_str)}"
+    )
+    # Note: total member count omitted because it would require an extra API call per join
+    return text
 
-    print(f"\n📊 SUMMARY: Monitoring {len(verified_servers)}/{len(SERVERS)} servers")
-    print("\n🚀 Bot is running. Waiting for new members...\n")
+def monitor_servers():
+    global previous_members, member_details
+    while True:
+        for guild_id, server_name in SERVERS.items():
+            if guild_id in IGNORED_SERVERS:
+                continue
+            try:
+                members = get_all_members(guild_id)
+                current_ids = {m['user']['id'] for m in members}
+                if guild_id in previous_members:
+                    old_ids = previous_members[guild_id]
+                    new_ids = current_ids - old_ids
+                    for uid in new_ids:
+                        # find the member object
+                        member_obj = next((m for m in members if m['user']['id'] == uid), None)
+                        if member_obj:
+                            alert_text = format_alert(member_obj, server_name)
+                            send_telegram(alert_text)
+                            print(f"🔔 [{server_name}] New member {member_obj['user']['username']} (polling)")
+                previous_members[guild_id] = current_ids
+                # Optional: store member details for future alerts
+                for m in members:
+                    member_details.setdefault(guild_id, {})[m['user']['id']] = m
+            except Exception as e:
+                print(f"Error polling {server_name} ({guild_id}): {e}")
+        time.sleep(45)  # poll every 45 seconds
 
-@client.event
-async def on_member_join(member):
-    gid = str(member.guild.id)
-    if gid in IGNORED_SERVERS:
-        return
-    if gid not in verified_servers:
-        now = time.time()
-        if now - last_debug_time.get(gid, 0) > 30:
-            print(f"🔍 [DEBUG] Join in non‑monitored server: {member.guild.name} (ID: {gid})")
-            last_debug_time[gid] = now
-        return
-
-    server_name = verified_servers[gid]
-    print(f"🔔 [{server_name}] {member.name} just joined! Total members: {member.guild.member_count}")
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, send_telegram_alert, member, server_name)
-
-# ------------------ RUN ------------------
+# ------------------ START ------------------
 if __name__ == "__main__":
     keep_alive()
-    print("\n🚀 STARTING DISCORD SELF-BOT MONITOR (42 servers)")
-    print("⚠️  WARNING: This violates Discord ToS – use at your own risk\n")
-    try:
-        client.run(DISCORD_TOKEN)
-    except Exception as e:
-        print(f"❌ Fatal error: {e}")
+    # Verify which servers the bot is actually a member of (for startup message)
+    print("Checking server membership...")
+    test_url = "https://discord.com/api/v9/users/@me/guilds"
+    resp = requests.get(test_url, headers=HEADERS)
+    if resp.status_code == 200:
+        user_guilds = {str(g['id']) for g in resp.json()}
+        connected = sum(1 for sid in SERVERS if sid in user_guilds and sid not in IGNORED_SERVERS)
+    else:
+        connected = 0
+    total = len(SERVERS)
+    send_startup_message(connected, total)
+    print(f"Starting polling monitor: {connected}/{total} servers reachable.")
+    # Start polling in a separate thread
+    poll_thread = Thread(target=monitor_servers, daemon=True)
+    poll_thread.start()
+    # Keep main thread alive
+    while True:
+        time.sleep(60)
