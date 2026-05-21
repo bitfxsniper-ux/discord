@@ -10,7 +10,7 @@ import requests
 import discord
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask
 from threading import Thread
 
@@ -91,8 +91,8 @@ def send_telegram_alert(member, server_name: str):
     joined_str = joined_at.strftime("%Y-%m-%d %H:%M UTC") if joined_at else "Unknown"
     discrim = f"#{member.discriminator}" if member.discriminator and member.discriminator != "0" else ""
 
-    # Calculate account age
-    now = datetime.utcnow()
+    # Calculate account age using aware datetime
+    now = datetime.now(timezone.utc)
     delta = now - member.created_at
     years = delta.days // 365
     months = (delta.days % 365) // 30
@@ -129,7 +129,7 @@ def send_telegram_alert(member, server_name: str):
     except Exception as e:
         print(f"  ❌ Telegram exception: {e}")
 
-# ------------------ FLASK KEEP-ALIVE (for Render) ------------------
+# ------------------ FLASK KEEP-ALIVE ------------------
 app = Flask(__name__)
 
 @app.route('/')
@@ -154,7 +154,7 @@ joined_servers = set()
 async def on_ready():
     print("=" * 60)
     print(f"✅ LOGGED IN AS: {client.user} ({client.user.id})")
-    print(f"📅 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📅 Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
     print("=" * 60)
 
     print("\n📋 SERVERS YOU ARE IN:")
@@ -181,7 +181,6 @@ async def on_member_join(member):
     if gid in IGNORED_SERVERS:
         return
     if gid not in verified_servers:
-        # rate‑limit debug prints
         now = time.time()
         if now - last_debug_time.get(gid, 0) > 30:
             print(f"🔍 [DEBUG] Join in non‑monitored server: {member.guild.name} (ID: {gid})")
@@ -195,7 +194,7 @@ async def on_member_join(member):
 
 # ------------------ RUN ------------------
 if __name__ == "__main__":
-    keep_alive()   # start Flask web server
+    keep_alive()
     print("\n🚀 STARTING DISCORD SELF-BOT MONITOR (42 servers)")
     print("⚠️  WARNING: This violates Discord ToS – use at your own risk\n")
     try:
